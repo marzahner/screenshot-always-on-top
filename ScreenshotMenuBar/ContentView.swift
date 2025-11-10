@@ -70,6 +70,8 @@ class InteractiveImageNSView: NSView {
     var onColorClick: ((String) -> Void)?
 
     private var trackingArea: NSTrackingArea?
+    private var currentMouseLocation: NSPoint?
+    private var bitmapCache: NSBitmapImageRep?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -85,7 +87,8 @@ class InteractiveImageNSView: NSView {
         let options: NSTrackingArea.Options = [
             .activeInKeyWindow,
             .mouseMoved,
-            .mouseEnteredAndExited
+            .mouseEnteredAndExited,
+            .inVisibleRect
         ]
         trackingArea = NSTrackingArea(
             rect: bounds,
@@ -113,6 +116,11 @@ class InteractiveImageNSView: NSView {
 
         let imageRect = getImageRect()
         image.draw(in: imageRect)
+
+        // Draw magnifier loupe if mouse is over the view
+        if let mouseLocation = currentMouseLocation, imageRect.contains(mouseLocation) {
+            drawMagnifier(at: mouseLocation, imageRect: imageRect)
+        }
     }
 
     private func getImageRect() -> NSRect {
@@ -141,7 +149,22 @@ class InteractiveImageNSView: NSView {
         return drawRect
     }
 
-    private func getPixelColor(at point: NSPoint) -> NSColor? {
+    private func getBitmap() -> NSBitmapImageRep? {
+        if let cached = bitmapCache {
+            return cached
+        }
+
+        guard let image = image,
+              let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+
+        bitmapCache = bitmap
+        return bitmap
+    }
+
+    private func getPixelColor(at point: NSPoint) -> (color: NSColor, imageX: Int, imageY: Int)? {
         guard let image = image else { return nil }
 
         let imageRect = getImageRect()
@@ -157,14 +180,142 @@ class InteractiveImageNSView: NSView {
         let imageY = Int((1 - relativeY) * image.size.height) // Flip Y coordinate
 
         // Get pixel data
-        guard let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
+        guard let bitmap = getBitmap(),
               imageX >= 0, imageX < Int(image.size.width),
-              imageY >= 0, imageY < Int(image.size.height) else {
+              imageY >= 0, imageY < Int(image.size.height),
+              let color = bitmap.colorAt(x: imageX, y: imageY) else {
             return nil
         }
 
-        return bitmap.colorAt(x: imageX, y: imageY)
+        return (color, imageX, imageY)
+    }
+
+    private func drawMagnifier(at point: NSPoint, imageRect: NSRect) {
+        guard let image = image,
+              let bitmap = getBitmap(),
+              let pixelInfo = getPixelColor(at: point) else { return }
+
+        let loupeSize: CGFloat = 120
+        let loupeRadius = loupeSize / 2
+        let magnification: CGFloat = 8
+        let pixelSize = loupeSize / 11 // Show 11x11 grid
+
+        // Position loupe above and to the right of cursor
+        var loupeX = point.x + 20
+        var loupeY = point.y + 20
+
+        // Keep loupe within bounds
+        if loupeX + loupeSize > bounds.width {
+            loupeX = point.x - loupeSize - 20
+        }
+        if loupeY + loupeSize + 80 > bounds.height {
+            loupeY = point.y - loupeSize - 20
+        }
+
+        let loupeRect = NSRect(x: loupeX, y: loupeY, width: loupeSize, height: loupeSize)
+
+        // Draw loupe background and border
+        let loupePath = NSBezierPath(ovalIn: loupeRect)
+        NSColor.white.setFill()
+        loupePath.fill()
+
+        // Clip to circle for magnified content
+        loupePath.addClip()
+
+        // Calculate the region to magnify (5 pixels around cursor in image space)
+        let centerImageX = pixelInfo.imageX
+        let centerImageY = pixelInfo.imageY
+        let gridSize = 5
+
+        // Draw magnified pixels
+        for dy in -gridSize...gridSize {
+            for dx in -gridSize...gridSize {
+                let sampleX = centerImageX + dx
+                let sampleY = centerImageY + dy
+
+                if sampleX >= 0 && sampleX < Int(image.size.width) &&
+                   sampleY >= 0 && sampleY < Int(image.size.height),
+                   let pixelColor = bitmap.colorAt(x: sampleX, y: sampleY) {
+
+                    pixelColor.setFill()
+
+                    let pixelX = loupeX + loupeRadius + CGFloat(dx) * pixelSize - pixelSize / 2
+                    let pixelY = loupeY + loupeRadius + CGFloat(dy) * pixelSize - pixelSize / 2
+
+                    let pixelRect = NSRect(x: pixelX, y: pixelY, width: pixelSize, height: pixelSize)
+                    NSBezierPath(rect: pixelRect).fill()
+                }
+            }
+        }
+
+        // Draw crosshair in center
+        NSGraphicsContext.saveGraphicsState()
+        loupePath.setClip()
+
+        NSColor.white.setStroke()
+        let crosshairPath = NSBezierPath()
+        crosshairPath.lineWidth = 1.5
+
+        // Horizontal line
+        crosshairPath.move(to: NSPoint(x: loupeX + loupeRadius - 15, y: loupeY + loupeRadius))
+        crosshairPath.line(to: NSPoint(x: loupeX + loupeRadius + 15, y: loupeY + loupeRadius))
+
+        // Vertical line
+        crosshairPath.move(to: NSPoint(x: loupeX + loupeRadius, y: loupeY + loupeRadius - 15))
+        crosshairPath.line(to: NSPoint(x: loupeX + loupeRadius, y: loupeY + loupeRadius + 15))
+
+        crosshairPath.stroke()
+
+        // Black outline for crosshair
+        NSColor.black.setStroke()
+        crosshairPath.lineWidth = 0.5
+        crosshairPath.stroke()
+
+        NSGraphicsContext.restoreGraphicsState()
+
+        // Draw loupe border
+        let borderPath = NSBezierPath(ovalIn: loupeRect)
+        borderPath.lineWidth = 3
+        NSColor.darkGray.setStroke()
+        borderPath.stroke()
+
+        // Draw color info below loupe
+        let hexCode = colorToHex(pixelInfo.color)
+        let infoY = loupeY - 35
+
+        // Color swatch
+        let swatchRect = NSRect(x: loupeX, y: infoY, width: 30, height: 30)
+        pixelInfo.color.setFill()
+        NSBezierPath(rect: swatchRect).fill()
+        NSColor.white.setStroke()
+        let swatchBorder = NSBezierPath(rect: swatchRect)
+        swatchBorder.lineWidth = 2
+        swatchBorder.stroke()
+
+        // Hex code text
+        let textRect = NSRect(x: loupeX + 35, y: infoY, width: 85, height: 30)
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .left
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.8)
+        shadow.shadowOffset = NSSize(width: 0, height: 0)
+        shadow.shadowBlurRadius = 3
+
+        let shadowAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraphStyle,
+            .shadow: shadow
+        ]
+
+        (hexCode as NSString).draw(in: textRect, withAttributes: shadowAttrs)
     }
 
     private func colorToHex(_ color: NSColor) -> String {
@@ -179,24 +330,29 @@ class InteractiveImageNSView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
+        currentMouseLocation = location
 
-        if let color = getPixelColor(at: location) {
-            let hexCode = colorToHex(color)
+        if let pixelInfo = getPixelColor(at: location) {
+            let hexCode = colorToHex(pixelInfo.color)
             onColorHover?(hexCode)
         } else {
             onColorHover?(nil)
         }
+
+        needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
+        currentMouseLocation = nil
         onColorHover?(nil)
+        needsDisplay = true
     }
 
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
 
-        if let color = getPixelColor(at: location) {
-            let hexCode = colorToHex(color)
+        if let pixelInfo = getPixelColor(at: location) {
+            let hexCode = colorToHex(pixelInfo.color)
             onColorClick?(hexCode)
         }
     }
@@ -235,38 +391,15 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 16) {
             if let screenshot = manager.screenshot {
-                ZStack(alignment: .topLeading) {
-                    InteractiveImageView(
-                        image: screenshot,
-                        hoveredColor: $hoveredColor,
-                        onColorClick: { hexCode in
-                            copyToClipboard(hexCode)
-                        }
-                    )
-                    .frame(maxWidth: 380, maxHeight: 380)
-                    .border(Color.gray.opacity(0.3), width: 1)
-
-                    if let hexCode = hoveredColor {
-                        HStack {
-                            Text(hexCode)
-                                .font(.system(.caption, design: .monospaced))
-                                .padding(6)
-                                .background(Color.black.opacity(0.8))
-                                .foregroundColor(.white)
-                                .cornerRadius(4)
-
-                            Rectangle()
-                                .fill(Color(NSColor(hex: hexCode) ?? .black))
-                                .frame(width: 20, height: 20)
-                                .cornerRadius(2)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 2)
-                                        .stroke(Color.white, lineWidth: 1)
-                                )
-                        }
-                        .padding(8)
+                InteractiveImageView(
+                    image: screenshot,
+                    hoveredColor: $hoveredColor,
+                    onColorClick: { hexCode in
+                        copyToClipboard(hexCode)
                     }
-                }
+                )
+                .frame(maxWidth: 380, maxHeight: 380)
+                .border(Color.gray.opacity(0.3), width: 1)
                 
                 HStack(spacing: 12) {
                     Button("Paste New") {
@@ -346,39 +479,16 @@ struct FloatingWindowView: View {
     @State private var hoveredColor: String?
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            InteractiveImageView(
-                image: image,
-                hoveredColor: $hoveredColor,
-                onColorClick: { hexCode in
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(hexCode, forType: .string)
-                }
-            )
-            .padding(10)
-
-            if let hexCode = hoveredColor {
-                HStack {
-                    Text(hexCode)
-                        .font(.system(.caption, design: .monospaced))
-                        .padding(6)
-                        .background(Color.black.opacity(0.8))
-                        .foregroundColor(.white)
-                        .cornerRadius(4)
-
-                    Rectangle()
-                        .fill(Color(NSColor(hex: hexCode) ?? .black))
-                        .frame(width: 20, height: 20)
-                        .cornerRadius(2)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 2)
-                                .stroke(Color.white, lineWidth: 1)
-                        )
-                }
-                .padding(18)
+        InteractiveImageView(
+            image: image,
+            hoveredColor: $hoveredColor,
+            onColorClick: { hexCode in
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(hexCode, forType: .string)
             }
-        }
+        )
+        .padding(10)
     }
 }
 
